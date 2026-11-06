@@ -303,6 +303,7 @@ def cmd_dup(args) -> int:
         winnow=not args.no_winnow,
         keep_common=args.keep_common,
         max_df=args.max_df,
+        jobs=args.jobs,
     )
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
@@ -374,6 +375,7 @@ def cmd_audit(args) -> int:
         winnow=not args.no_winnow,
         keep_common=args.keep_common,
         max_df=args.max_df,
+        jobs=args.jobs,
     )
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
@@ -541,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cross-language", action="store_true", help=t("h.dup.cross_language"))
     p.add_argument("--max-candidates", type=int, help=t("h.dup.max_candidates"))
     p.add_argument("--evidence", type=int, default=3, help=t("h.dup.evidence"))
+    p.add_argument("-j", "--jobs", type=int, default=1, help=t("h.dup.jobs"))
     p.add_argument("--top", type=int, default=50, help=t("h.dup.top"))
     p.add_argument("--all", action="store_true", help=t("h.dup.all"))
     p.add_argument("--fail-on", choices=("none", "any", "cross-user"),
@@ -584,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all-problems", action="store_true", help=t("h.dup.all_problems"))
     p.add_argument("--cross-language", action="store_true", help=t("h.dup.cross_language"))
     p.add_argument("--evidence", type=int, default=3, help=t("h.dup.evidence"))
+    p.add_argument("-j", "--jobs", type=int, default=1, help=t("h.dup.jobs"))
     p.add_argument("--fail-on", choices=("none", "duplicate", "any"), default="duplicate",
                    help=t("h.audit.fail_on"))
     p.set_defaults(func=cmd_audit)

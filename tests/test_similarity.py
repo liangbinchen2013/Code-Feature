@@ -274,3 +274,25 @@ def test_the_optimised_pipeline_matches_brute_force_pairwise(tmp_path):
         if sim.qualifies:
             slow.add((min(a.id, b.id), max(a.id, b.id)))
     assert fast == slow, (fast - slow, slow - fast)
+
+
+def test_jobs_matches_serial(tmp_path):
+    """Spreading the shards over processes may change scheduling, never the report.
+
+    The parallel pass counts candidates per process and re-merges them in the parent, so this
+    compares the whole report - pairs, evidence, submission info and every warning counter - not
+    just the pair ids.  max_candidates is in the list because it truncates globally, across shards.
+    """
+    texts = [BASE, renamed(BASE), BASE.replace("cache_", "memo_"), read_sample("cpp_allman.cpp"),
+             read_sample("mixed.cpp"), read_sample("cpp_allman.cpp").replace("values", "nums"),
+             BASE.replace("total", "acc"), read_sample("cpp_allman.cpp").replace("total", "acc")]
+    subs = []
+    for i, text in enumerate(texts):
+        suffix = ".go" if "func main" in text else (".js" if "export" in text else ".cpp")
+        path = tmp_path / f"s{i}{suffix}"
+        path.write_text(text, encoding="utf-8")
+        subs.append(Submission(path=str(path), id=f"s{i}", user=f"u{i % 3}", problem=f"P{i % 4}"))
+    for kwargs in (dict(min_tokens=20, min_shared=2), dict(min_tokens=20, min_shared=2, evidence=0),
+                   dict(min_tokens=20, max_candidates=3)):
+        serial = find_duplicates(subs, jobs=1, **kwargs).to_dict()
+        assert find_duplicates(subs, jobs=2, **kwargs).to_dict() == serial, kwargs

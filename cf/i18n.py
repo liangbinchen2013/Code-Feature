@@ -298,6 +298,9 @@ _MESSAGES: list[tuple[str, str, str]] = [
     ("h.dup.max_candidates", "cap the candidate pairs examined (warns when it cuts)",
      "限制比较的候选对数量（截断时会提示）"),
     ("h.dup.evidence", "matched row ranges listed per pair", "每对最多列出几个匹配行段"),
+    ("h.dup.jobs", "spread the comparison over this many processes; 0 uses every cpu "
+                    "(the report is identical either way)",
+     "把比较分到这么多个进程，0 表示用满所有 cpu（两种方式的结果完全一致）"),
     ("h.dup.top", "maximum pairs in the text report (JSON always lists all qualifying pairs)",
      "文本报告最多列出几对（JSON 始终包含全部达标配对）"),
     ("h.dup.all", "print every qualifying pair", "打印全部达标配对"),

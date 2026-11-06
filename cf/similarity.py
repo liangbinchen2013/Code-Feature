@@ -9,13 +9,14 @@ report: evidence is line ranges and token counts only.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
 from dataclasses import dataclass, field
 
-from .document import Document, build_document
-from .tokens import CHR, CMT, ID, KW, NUM, PRE, PUNCT, STR
+from .document import Document, build_document, normalize as normalize_text
+from .tokens import CHR, CMT, ID, KW, NUM, PRE, PUNCT, SPEC_BY_NAME, STR, detect
 
 SCHEMA_VERSION = 1
 DEFAULT_K = 7
@@ -455,6 +456,144 @@ def read_document(sub: Submission) -> Document:
 
 # -- corpus pass --------------------------------------------------------------
 
+# A shard's documents and fingerprints stay in the process that lexed them, so the scoring pass
+# over the same shard does not read the files a second time.
+_SHARD_CACHE: dict[tuple, tuple] = {}
+_RUN_IDS = itertools.count(1)
+
+
+def _shard_of(sub: Submission, same_problem: bool, same_language: bool) -> tuple:
+    """The (problem, language family) shard a submission belongs to, decided without lexing it.
+
+    Sharding is what keeps the pass cheap, so the parent must be able to partition before paying
+    for the lexer; the worker re-reads the same file anyway, it just does it in parallel.
+    """
+    family = None
+    if same_language:
+        if sub.language:
+            if sub.language not in SPEC_BY_NAME:
+                raise SimilarityError(f"unknown language {sub.language!r} for {sub.id}")
+            family = SPEC_BY_NAME[sub.language].family
+        elif sub.text is not None:
+            family = detect(sub.path, normalize_text(sub.text)[0]).family
+        else:
+            from .sources import InputError, decode_bytes, read_bytes
+
+            try:
+                text, _enc = decode_bytes(read_bytes(sub.path))
+            except InputError as exc:
+                raise SimilarityError(str(exc)) from exc
+            family = detect(sub.path, normalize_text(text)[0]).family
+    return (sub.problem if same_problem else None, family)
+
+
+def _lex_shard(subs: list[Submission], params: dict):
+    """Lex one shard and split off the k-grams that say nothing about matching in this shard."""
+    docs, fps = [], []
+    for sub in subs:
+        doc = read_document(sub)
+        docs.append(doc)
+        fps.append(fingerprint(doc, k=params["k"], window=params["window"], winnow=params["winnow"]))
+    kept = [f.hashes for f in fps]
+    if params["keep_common"] or len(subs) < BOILERPLATE_MIN_DOCS:
+        return docs, fps, kept, frozenset(), 0
+    df: dict[int, int] = {}
+    for hashes in kept:
+        for h in hashes:
+            df[h] = df.get(h, 0) + 1
+    drop = {h for h, count in df.items() if count > params["max_df"] * len(subs)}
+    if not drop:
+        return docs, fps, kept, frozenset(), 0
+    frozen = frozenset(drop)
+    return docs, fps, [h - frozen for h in kept], frozen, len(drop)
+
+
+def _count_shard(payload: dict) -> dict:
+    """Read a shard, then count how many representatives each pair inside it shares.
+
+    Candidate codes use the corpus-wide index space (``i * n + j``), not shard-local positions, so
+    the caller can order and truncate candidates globally: ``max_candidates`` has to mean the same
+    thing sharded or not, and a per-shard budget would quietly multiply it by the number of shards.
+    """
+    subs, params, gidx = payload["subs"], payload["params"], payload["gidx"]
+    for stale in [k for k in _SHARD_CACHE if k[0] != payload["run"]]:
+        del _SHARD_CACHE[stale]      # the previous run's shards: this run's scoring pops as it goes
+    docs, fps, kept, frozen, filtered = _lex_shard(subs, params)
+    index: dict[int, list[int]] = {}
+    for pos, hashes in enumerate(kept):
+        for h in hashes:
+            index.setdefault(h, []).append(pos)
+    candidates: dict[int, int] = {}
+    capped = 0
+    n = params["n"]
+    for holders in index.values():
+        if len(holders) > MAX_POSTINGS:
+            capped += 1
+            continue  # this k-gram cannot discriminate inside such a large shard
+        for x in range(len(holders)):
+            left = gidx[holders[x]] * n
+            for y in range(x + 1, len(holders)):
+                code = left + gidx[holders[y]]
+                candidates[code] = candidates.get(code, 0) + 1
+    _SHARD_CACHE[payload["run"], payload["key"]] = (subs, docs, fps, kept, frozen)
+    # short or contentless submissions cannot carry evidence; say so at report level, because
+    # the pairs they would have produced are filtered out and would never be shown
+    infos, short = [], []
+    for pos, sub in enumerate(subs):
+        fp = fps[pos]
+        infos.append(SubmissionInfo(sub.id, sub.user, sub.problem, sub.path, docs[pos].spec.name,
+                                    fp.tokens, fp.rows))
+        if fp.tokens < params["min_tokens"]:
+            short.append((sub.id, f"too-short:{sub.id}:{fp.tokens}"))
+        elif not fp.kgrams:
+            short.append((sub.id, f"no-kgrams:{sub.id}"))
+    return {"candidates": list(candidates.items()),
+            "sizes": [(gidx[p], len(kept[p])) for p in range(len(subs))],
+            "infos": infos, "short": short, "filtered": filtered, "capped": capped}
+
+
+def _score_shard(payload: dict) -> list:
+    """Take evidence for the pairs the caller kept, in the shard that already lexed them."""
+    subs, params, gidx = payload["subs"], payload["params"], payload["gidx"]
+    state = _SHARD_CACHE.pop((payload["run"], payload["key"]), None)
+    if state is None:  # the shard was never counted here: a recycled worker, or a direct call
+        docs, fps, kept, frozen, _f = _lex_shard(subs, params)
+    else:
+        docs, fps, kept, frozen = state[1], state[2], state[3], state[4]
+    pos = {g: p for p, g in enumerate(gidx)}
+    out = []
+    for i, j, _shared in payload["pairs"]:
+        pi, pj = pos[i], pos[j]
+        sim = _compare(docs[pi], docs[pj], fps[pi], fps[pj], kept[pi], kept[pj],
+                       meta_a=subs[pi], meta_b=subs[pj], k=params["k"],
+                       min_shared=params["min_shared"], min_jaccard=params["min_jaccard"],
+                       min_containment=params["min_containment"], min_tokens=params["min_tokens"],
+                       evidence=params["evidence"], drop=frozen)
+        if sim.qualifies:
+            out.append(sim)
+    return out
+
+
+def _pool_for(jobs: int, count: int):
+    """A process pool for one run, or None to do the work in this process.
+
+    One pool serves both passes because creating it costs interpreter startup per worker; paying
+    that twice per run would eat the win on anything but the largest corpora.
+    """
+    if jobs < 2 or count < 2:
+        return None
+    import multiprocessing
+
+    return multiprocessing.Pool(min(jobs, count))
+
+
+def _spread(work, payloads: list, pool):
+    """Run a shard pass inline or through the pool.  Results keep payload order, so sharding
+    cannot reorder anything the report shows."""
+    if pool is None:
+        return [work(p) for p in payloads]
+    return pool.map(work, payloads, chunksize=1)
+
 
 def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAULT_MIN_JACCARD,
                     min_containment: float = DEFAULT_MIN_CONTAINMENT,
@@ -463,12 +602,17 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
                     include_same_user: bool = True, include_cross_user: bool = True,
                     max_candidates: int | None = None, evidence: int = DEFAULT_EVIDENCE,
                     k: int = DEFAULT_K, window: int = DEFAULT_WINDOW, winnow: bool = True,
-                    keep_common: bool = False, max_df: float = BOILERPLATE_DOC_RATIO) -> SimilarityReport:
+                    keep_common: bool = False, max_df: float = BOILERPLATE_DOC_RATIO,
+                    jobs: int = 1) -> SimilarityReport:
     """Compare a set of submissions and group the pairs that share too much.
 
-    ``max_df`` is the document frequency, as a fraction of the bucket, above which a k-gram is
+    ``max_df`` is the document frequency, as a fraction of the shard, above which a k-gram is
     treated as boilerplate: it appears in nearly every submission of that problem, so it says
     nothing about whether two of them match.
+
+    ``jobs`` spreads the shards over processes: 1 keeps everything in this process, 0 uses every
+    cpu, any larger number caps it.  It changes scheduling only - the report is identical either
+    way, which ``test_jobs_matches_serial`` pins down.
     """
     report = SimilarityReport(params={
         "k": k, "window": window, "min_jaccard": round(min_jaccard, 3),
@@ -482,110 +626,101 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
     if len(set(ids)) != len(ids):
         raise SimilarityError("submission ids must be unique")
 
-    docs, fps, subs = [], [], sorted(submissions, key=lambda s: s.id)
-    for sub in subs:
-        doc = read_document(sub)
-        docs.append(doc)
-        fps.append(fingerprint(doc, k=k, window=window, winnow=winnow))
-        report.submissions.append(SubmissionInfo(sub.id, sub.user, sub.problem, sub.path,
-                                                 doc.spec.name, fps[-1].tokens, fps[-1].rows))
-    # short or contentless submissions cannot carry evidence; say so at report level, because
-    # the pairs they would have produced are filtered out and would never be shown
-    for sub, fp in zip(subs, fps):
-        if fp.tokens < min_tokens:
-            report.warnings.append(f"too-short:{sub.id}:{fp.tokens}")
-        elif not fp.kgrams:
-            report.warnings.append(f"no-kgrams:{sub.id}")
-
-    # Candidates are generated per (problem, language family) bucket, never globally: a
-    # boilerplate k-gram sitting in most of 2000 submissions would otherwise be counted
-    # 2000*1999/2 times, while submissions to different problems are never compared anyway.
-    buckets: dict[tuple, list[int]] = {}
-    for idx, sub in enumerate(subs):
-        key = (sub.problem if same_problem else None,
-               docs[idx].spec.family if same_language else None)
-        buckets.setdefault(key, []).append(idx)
+    subs = sorted(submissions, key=lambda s: s.id)
     n = len(subs)
-    kept: list[frozenset] = [fps[i].hashes for i in range(n)]
-    drops: list[frozenset] = [frozenset()] * n   # per bucket: which k-grams were treated as boilerplate
-    candidates: dict[int, int] = {}
-    filtered = 0
-    capped = 0
-    for key, members in sorted(buckets.items(), key=lambda item: str(item[0])):
-        members.sort()
-        if len(members) < 2:
-            continue
-        drop: set[int] = set()
-        if not keep_common and len(members) >= BOILERPLATE_MIN_DOCS:
-            df: dict[int, int] = {}
-            for i in members:
-                for h in fps[i].hashes:
-                    df[h] = df.get(h, 0) + 1
-            cut = max_df * len(members)
-            drop = {h for h, count in df.items() if count > cut}
-            filtered += len(drop)
-        if drop:
-            frozen = frozenset(drop)
-            for i in members:
-                kept[i] = fps[i].hashes - frozen
-                drops[i] = frozen
-        index: dict[int, list[int]] = {}
-        for i in members:
-            for h in kept[i]:
-                index.setdefault(h, []).append(i)
-        for holders in index.values():
-            if len(holders) > MAX_POSTINGS:
-                capped += 1
-                continue  # this k-gram cannot discriminate inside such a large bucket
-            for x in range(len(holders)):
-                left = holders[x] * n
-                for y in range(x + 1, len(holders)):
-                    code = left + holders[y]
-                    candidates[code] = candidates.get(code, 0) + 1
-    if filtered:
-        report.warnings.append(f"boilerplate-filtered:{filtered}")
-    if capped:
-        report.warnings.append(f"postings-capped:{capped}")
-    if same_problem:
-        untagged = sum(1 for sub in subs if not sub.problem)
-        if untagged:
-            report.warnings.append(f"no-problem-id:{untagged}(compared globally)")
-    if same_language and len(buckets) > len({key[0] for key in buckets}):
-        report.warnings.append(f"language-split:{len(buckets)}")
+    params = {"k": k, "window": window, "winnow": winnow, "n": n, "min_shared": min_shared,
+              "min_jaccard": min_jaccard, "min_containment": min_containment,
+              "min_tokens": min_tokens, "evidence": evidence, "keep_common": keep_common,
+              "max_df": max_df}
+    # Candidates are generated per (problem, language family) shard, never globally: a boilerplate
+    # k-gram sitting in most of 2000 submissions would otherwise be counted 2000*1999/2 times,
+    # while submissions to different problems are never compared anyway.  Shards are disjoint, so
+    # they can also be worked in parallel - which is how the pass stays flat past 1000 people.
+    shards: dict[tuple, list[int]] = {}
+    owner: dict[int, tuple] = {}
+    for idx, sub in enumerate(subs):
+        key = _shard_of(sub, same_problem, same_language)
+        shards.setdefault(key, []).append(idx)
+        owner[idx] = key
+    run = next(_RUN_IDS)
+    payloads = []
+    for key in sorted(shards, key=str):
+        members = sorted(shards[key])
+        payloads.append({"run": run, "key": key, "gidx": members, "params": params,
+                         "subs": [subs[i] for i in members]})
+    workers = _pool_for((os.cpu_count() or 1) if jobs < 1 else jobs, len(payloads))
+    try:
+        counted = _spread(_count_shard, payloads, workers)
+        candidates: dict[int, int] = {}
+        sizes: dict[int, int] = {}
+        short: list[tuple[str, str]] = []
+        filtered = 0
+        capped = 0
+        for result in counted:
+            report.submissions.extend(result["infos"])
+            candidates.update(result["candidates"])
+            sizes.update(result["sizes"])
+            short.extend(result["short"])
+            filtered += result["filtered"]
+            capped += result["capped"]
+        report.submissions.sort(key=lambda info: info.id)
+        for _sid, warning in sorted(short, key=lambda item: item[0]):
+            report.warnings.append(warning)
+        if filtered:
+            report.warnings.append(f"boilerplate-filtered:{filtered}")
+        if capped:
+            report.warnings.append(f"postings-capped:{capped}")
+        if same_problem:
+            untagged = sum(1 for sub in subs if not sub.problem)
+            if untagged:
+                report.warnings.append(f"no-problem-id:{untagged}(compared globally)")
+        if same_language and len(shards) > len({key[0] for key in shards}):
+            report.warnings.append(f"language-split:{len(shards)}")
 
-    ordered = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
-    if max_candidates is not None and len(ordered) > max_candidates:
-        report.warnings.append(f"candidates-truncated:{len(ordered) - max_candidates}")
-        ordered = ordered[:max_candidates]
+        ordered = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
+        if max_candidates is not None and len(ordered) > max_candidates:
+            report.warnings.append(f"candidates-truncated:{len(ordered) - max_candidates}")
+            ordered = ordered[:max_candidates]
 
-    # The postings count for a pair *is* |ha ∩ hb| (a representative appears at most once per
-    # document), so both scores follow exactly from the counts we already have - no set work and
-    # no approximation.  Note containment cannot be bounded by the size ratio: for a subset copy
-    # it reaches 1.0 however different the sizes are, so pruning on ratio would lose real matches.
-    pruned_by_score = 0
-    for code, shared in ordered:
-        i, j = divmod(code, n)
-        if shared < min_shared:
-            continue
-        sub_a, sub_b = subs[i], subs[j]
-        if sub_a.user == sub_b.user and not include_same_user:
-            continue
-        if sub_a.user != sub_b.user and not include_cross_user:
-            continue
-        sizes = (len(kept[i]), len(kept[j]))
-        smaller = min(sizes)
-        union = sizes[0] + sizes[1] - shared
-        containment = shared / smaller if smaller else 0.0
-        jaccard = shared / union if union else 0.0
-        if jaccard < min_jaccard and containment < min_containment:
-            pruned_by_score += 1
-            continue
-        sim = _compare(docs[i], docs[j], fps[i], fps[j], kept[i], kept[j],
-                       meta_a=sub_a, meta_b=sub_b, k=k, min_shared=min_shared,
-                       min_jaccard=min_jaccard, min_containment=min_containment,
-                       min_tokens=min_tokens, evidence=evidence, drop=drops[i])
-        if sim.qualifies:
-            report.pairs.append(sim)
+        # The postings count for a pair *is* |ha ∩ hb| (a representative appears at most once per
+        # document), so both scores follow exactly from the counts we already have - no set work
+        # and no approximation.  Note containment cannot be bounded by the size ratio: for a
+        # subset copy it reaches 1.0 however different the sizes are, so pruning on ratio would
+        # lose real matches.
+        todo: dict[tuple, list] = {}
+        pruned_by_score = 0
+        for code, shared in ordered:
+            i, j = divmod(code, n)
+            if shared < min_shared:
+                continue
+            sub_a, sub_b = subs[i], subs[j]
+            if sub_a.user == sub_b.user and not include_same_user:
+                continue
+            if sub_a.user != sub_b.user and not include_cross_user:
+                continue
+            pair_sizes = (sizes[i], sizes[j])
+            smaller = min(pair_sizes)
+            union = pair_sizes[0] + pair_sizes[1] - shared
+            containment = shared / smaller if smaller else 0.0
+            jaccard = shared / union if union else 0.0
+            if jaccard < min_jaccard and containment < min_containment:
+                pruned_by_score += 1
+                continue
+            todo.setdefault(owner[i], []).append((i, j, shared))
+        scoring = []
+        for payload in payloads:
+            pairs = todo.get(payload["key"])
+            if pairs:
+                item = dict(payload)
+                item["pairs"] = pairs
+                scoring.append(item)
+        chunks = _spread(_score_shard, scoring, workers)
+    finally:
+        if workers is not None:
+            workers.close()
+            workers.join()
+    for chunk in chunks:
+        report.pairs.extend(chunk)
     if pruned_by_score:
         report.warnings.append(f"pruned-by-score:{pruned_by_score}")
 
