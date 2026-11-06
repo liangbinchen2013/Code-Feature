@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass, field
 
 from .document import Document, build_document, normalize as normalize_text
-from .tokens import CHR, CMT, ID, KW, NUM, PRE, PUNCT, SPEC_BY_NAME, STR, detect
+from .tokens import CHR, CMT, ID, KW, NUM, PRE, PUNCT, SPEC_BY_NAME, STR, detect, spec_from_path
 
 SCHEMA_VERSION = 1
 DEFAULT_K = 7
@@ -474,16 +474,20 @@ def _shard_of(sub: Submission, same_problem: bool, same_language: bool) -> tuple
             if sub.language not in SPEC_BY_NAME:
                 raise SimilarityError(f"unknown language {sub.language!r} for {sub.id}")
             family = SPEC_BY_NAME[sub.language].family
-        elif sub.text is not None:
-            family = detect(sub.path, normalize_text(sub.text)[0]).family
         else:
-            from .sources import InputError, decode_bytes, read_bytes
+            by_path = spec_from_path(sub.path)
+            if by_path is not None:
+                family = by_path.family
+            elif sub.text is not None:
+                family = detect(sub.path, normalize_text(sub.text)[0]).family
+            else:
+                from .sources import InputError, decode_bytes, read_bytes
 
-            try:
-                text, _enc = decode_bytes(read_bytes(sub.path))
-            except InputError as exc:
-                raise SimilarityError(str(exc)) from exc
-            family = detect(sub.path, normalize_text(text)[0]).family
+                try:
+                    text, _enc = decode_bytes(read_bytes(sub.path))
+                except InputError as exc:
+                    raise SimilarityError(str(exc)) from exc
+                family = detect(sub.path, normalize_text(text)[0]).family
     return (sub.problem if same_problem else None, family)
 
 

@@ -296,3 +296,22 @@ def test_jobs_matches_serial(tmp_path):
                    dict(min_tokens=20, max_candidates=3)):
         serial = find_duplicates(subs, jobs=1, **kwargs).to_dict()
         assert find_duplicates(subs, jobs=2, **kwargs).to_dict() == serial, kwargs
+
+
+def test_the_shard_key_agrees_with_the_language_actually_lexed(tmp_path):
+    """The parent shards by (problem, family) before lexing, so that guess must not be a guess.
+
+    Sharding happens without reading the file whenever the name settles it, which is what makes
+    the parallel pass cheap; an extension-less sample covers the path that has to look inside.
+    """
+    from cf.similarity import _shard_of
+
+    for name in ("c_tabs.c", "cpp_allman.cpp", "cpp_knr.cpp", "go_style.go", "js_single.js",
+                 "mixed.cpp", "py_default.py"):
+        plain = tmp_path / name.split(".")[0]          # no extension: only the content decides
+        plain.write_text(read_sample(name), encoding="utf-8")
+        for path in (sample_path(name), str(plain)):
+            sub = Submission(path=path, id=os.path.basename(path))
+            assert _shard_of(sub, True, True)[1] == read_document(sub).spec.family, path
+    forced = Submission(path=sample_path("cpp_knr.cpp"), id="forced", language="python")
+    assert _shard_of(forced, True, True)[1] == read_document(forced).spec.family == "python"

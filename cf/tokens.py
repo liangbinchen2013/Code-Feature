@@ -183,15 +183,28 @@ class Token:
         return self.kind == KW and (not vals or self.text in vals)
 
 
+def spec_from_path(path: str | None) -> Spec | None:
+    """The spec a filename alone settles, or None when the content has to be read.
+
+    Callers that only need the family - sharding an audit, for instance - can skip reading the
+    file entirely, which is most of the cost when the extension is already decisive.
+    """
+    if not path:
+        return None
+    m = re.search(r"(\.[A-Za-z0-9]+)$", path)
+    if m and m.group(1).lower() in _EXT_MAP:
+        return SPEC_BY_NAME[_EXT_MAP[m.group(1).lower()]]
+    base = re.split(r"[/\\]", path)[-1].lower()
+    if base in ("makefile", "dockerfile"):
+        return SPEC_BY_NAME["shell"]
+    return None
+
+
 def detect(path: str | None, src: str) -> Spec:
     """Resolve a spec from filename, else from content heuristics."""
-    if path:
-        m = re.search(r"(\.[A-Za-z0-9]+)$", path)
-        if m and m.group(1).lower() in _EXT_MAP:
-            return SPEC_BY_NAME[_EXT_MAP[m.group(1).lower()]]
-        base = re.split(r"[/\\]", path)[-1].lower()
-        if base in ("makefile", "dockerfile"):
-            return SPEC_BY_NAME["shell"]
+    by_path = spec_from_path(path)
+    if by_path is not None:
+        return by_path
     head = src[:8000]
     # A Python class header is ``class Name:`` or ``class Name(Base, ...):`` and the colon ends the
     # line (a comment may follow).  ``class Foo : public Bar {`` and ``class Foo : Bar {`` are
