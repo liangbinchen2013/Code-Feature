@@ -287,6 +287,8 @@ _MESSAGES: list[tuple[str, str, str]] = [
     ("h.dup.no_winnow", "keep every k-gram hash instead of winnowing", "不做 winnowing，保留全部 k-gram 指纹"),
     ("h.dup.keep_common", "do not drop hashes shared by over 80% of the corpus",
      "不丢弃出现在超过 80% 提交里的公共指纹（模板代码）"),
+    ("h.dup.max_df", "treat a k-gram as boilerplate above this share of its problem bucket",
+     "在一个题目分片内，k-gram 覆盖比例超过此值就按模板代码剔除"),
     ("h.dup.cross_user", "report only pairs from different users", "只报告跨用户的配对"),
     ("h.dup.same_user", "report only pairs from the same user", "只报告同一用户的配对"),
     ("h.dup.all_problems", "compare submissions even when their problem ids differ",

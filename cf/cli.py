@@ -302,6 +302,7 @@ def cmd_dup(args) -> int:
         window=args.window,
         winnow=not args.no_winnow,
         keep_common=args.keep_common,
+        max_df=args.max_df,
     )
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
@@ -372,6 +373,7 @@ def cmd_audit(args) -> int:
         window=args.window,
         winnow=not args.no_winnow,
         keep_common=args.keep_common,
+        max_df=args.max_df,
     )
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
@@ -531,6 +533,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=4, help=t("h.dup.window"))
     p.add_argument("--no-winnow", action="store_true", help=t("h.dup.no_winnow"))
     p.add_argument("--keep-common", action="store_true", help=t("h.dup.keep_common"))
+    p.add_argument("--max-df", type=float, default=0.8, help=t("h.dup.max_df"))
     group = p.add_mutually_exclusive_group()
     group.add_argument("--cross-user", action="store_true", help=t("h.dup.cross_user"))
     group.add_argument("--same-user", action="store_true", help=t("h.dup.same_user"))
@@ -577,6 +580,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=4, help=t("h.dup.window"))
     p.add_argument("--no-winnow", action="store_true", help=t("h.dup.no_winnow"))
     p.add_argument("--keep-common", action="store_true", help=t("h.dup.keep_common"))
+    p.add_argument("--max-df", type=float, default=0.8, help=t("h.dup.max_df"))
     p.add_argument("--all-problems", action="store_true", help=t("h.dup.all_problems"))
     p.add_argument("--cross-language", action="store_true", help=t("h.dup.cross_language"))
     p.add_argument("--evidence", type=int, default=3, help=t("h.dup.evidence"))

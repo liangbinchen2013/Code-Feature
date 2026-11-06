@@ -27,11 +27,13 @@ DEFAULT_MIN_CONTAINMENT = 0.8
 DEFAULT_EVIDENCE = 3
 BOILERPLATE_MIN_DOCS = 10
 BOILERPLATE_DOC_RATIO = 0.8
+MAX_POSTINGS = 256      # a k-gram in more submissions than this cannot discriminate inside the bucket
 POSITION_CAP = 12          # a k-gram this repetitive is not useful evidence
 
 MASK64 = (1 << 64) - 1
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
+BASE = 257
 
 
 class SimilarityError(ValueError):
@@ -78,7 +80,7 @@ class Fingerprint:
     rows: int
     hashes: frozenset                      # winnowed representatives, the scoring basis
     kgrams: tuple                          # (normalised-token index, hash) for every k-gram
-    norm: tuple = ()                       # NormalToken sequence, for line mapping
+    row_at: tuple = ()                     # token index -> source row, so evidence carries no source
 
 @dataclass(frozen=True)
 class Submission:
@@ -226,24 +228,61 @@ def normalize(doc: Document) -> list[NormalToken]:
     return out
 
 
+_CODE_MEMO: dict[str, int] = {}
+
+
+def _token_code(key: str) -> int:
+    """A content-derived code per normalised token, so a k-gram hashes the same everywhere.
+
+    Interning against a per-run table would be faster still, but the ids would then depend on
+    the order files were read in, and two processes would disagree about what matches.
+    """
+    code = _CODE_MEMO.get(key)
+    if code is None:
+        code = fnv1a(key) or 1
+        if len(_CODE_MEMO) < 200_000:
+            _CODE_MEMO[key] = code
+    return code
+
+
+def _window_hashes(codes: list[int], k: int) -> list[tuple[int, int]]:
+    """Rabin-Karp rolling hash of every k-length window: O(1) per step, no string building.
+
+    The values depend only on the codes in the window, so they are stable across runs,
+    processes and file order - the same guarantee ``fnv1a`` gave, for a fraction of the work.
+    """
+    n = len(codes)
+    if n < k:
+        return []
+    power = pow(BASE, k - 1, 1 << 64)
+    h = 0
+    for i in range(k):
+        h = (h * BASE + codes[i]) & MASK64
+    out = [(0, h)]
+    for i in range(1, n - k + 1):
+        h = ((h - codes[i - 1] * power) * BASE + codes[i + k - 1]) & MASK64
+        out.append((i, h))
+    return out
+
+
 def fingerprint(doc: Document, *, k: int = DEFAULT_K, window: int = DEFAULT_WINDOW,
                 winnow: bool = True) -> Fingerprint:
     """The k-gram fingerprint of one document."""
     if k < 1:
         raise SimilarityError("k must be at least 1")
     norm = normalize(doc)
-    keys = [nt.key() for nt in norm]
-    kgrams = tuple((start, fnv1a(" ".join(keys[start:start + k])))
-                   for start in range(0, max(0, len(keys) - k + 1)))
-    rows = len(doc.lines)
+    codes = [_token_code(nt.key()) for nt in norm]
+    kgrams = tuple(_window_hashes(codes, k))
+    row_at = tuple(nt.row for nt in norm)      # token index -> source row, for evidence
     if not kgrams:
-        return Fingerprint(len(norm), rows, frozenset(), (), tuple(norm))
+        return Fingerprint(len(norm), len(doc.lines), frozenset(), (), row_at)
     if not winnow or window <= 1:
-        return Fingerprint(len(norm), rows, frozenset(h for _s, h in kgrams), kgrams, tuple(norm))
+        return Fingerprint(len(norm), len(doc.lines), frozenset(h for _s, h in kgrams), kgrams, row_at)
+    hashes = [h for _s, h in kgrams]
     keep: set[int] = set()
-    for i in range(len(kgrams)):
-        keep.add(min(kgrams[i:i + window], key=lambda pair: pair[1])[1])
-    return Fingerprint(len(norm), rows, frozenset(keep), kgrams, tuple(norm))
+    for i in range(len(hashes)):
+        keep.add(min(hashes[i:i + window]))
+    return Fingerprint(len(norm), len(doc.lines), frozenset(keep), kgrams, row_at)
 
 
 # -- evidence -----------------------------------------------------------------
@@ -278,7 +317,8 @@ def shared_runs(a: Fingerprint, b: Fingerprint, allowed: set, keep: int, k: int)
     runs.sort(key=lambda r: (-r[2], r[0], r[1]))
     spans: list[MatchSpan] = []
     taken: list[tuple[int, int]] = []
-    last = max(1, len(a.norm) - 1)
+    last_a = max(1, len(a.row_at) - 1)
+    last_b = max(1, len(b.row_at) - 1)
     for ai, bi, length in runs:
         a0, a1 = a.kgrams[ai][0], a.kgrams[min(ai + length - 1, len(a.kgrams) - 1)][0]
         b0, b1 = b.kgrams[bi][0], b.kgrams[min(bi + length - 1, len(b.kgrams) - 1)][0]
@@ -286,8 +326,8 @@ def shared_runs(a: Fingerprint, b: Fingerprint, allowed: set, keep: int, k: int)
             continue
         taken.append((a0, a1 + k - a0))
         spans.append(MatchSpan(
-            (a.norm[a0].row, a.norm[min(a1 + k - 1, last)].row),
-            (b.norm[b0].row, b.norm[min(b1 + k - 1, max(1, len(b.norm) - 1))].row),
+            (a.row_at[a0], a.row_at[min(a1 + k - 1, last_a)]),
+            (b.row_at[b0], b.row_at[min(b1 + k - 1, last_b)]),
             a1 - a0 + k,
         ))
         if len(spans) >= keep:
@@ -295,9 +335,7 @@ def shared_runs(a: Fingerprint, b: Fingerprint, allowed: set, keep: int, k: int)
     return spans, truncated
 
 
-def _scores(fa: Fingerprint, fb: Fingerprint, drop: set) -> tuple:
-    ha = fa.hashes - drop
-    hb = fb.hashes - drop
+def _scores(ha: frozenset, hb: frozenset) -> tuple:
     inter = len(ha & hb)
     union = len(ha | hb)
     jaccard = inter / union if union else 0.0
@@ -306,25 +344,27 @@ def _scores(fa: Fingerprint, fb: Fingerprint, drop: set) -> tuple:
     return (round(jaccard, 3), round(cab, 3), round(cba, 3), round(max(cab, cba), 3), inter)
 
 
-def _compare(a: Document, b: Document, fa: Fingerprint, fb: Fingerprint, *, meta_a, meta_b,
-             drop: set, k: int, min_shared: int, min_jaccard: float, min_containment: float,
-             min_tokens: int, evidence: int) -> Similarity:
-    jaccard, cab, cba, containment, shared = _scores(fa, fb, drop)
+def _compare(a: Document, b: Document, fa: Fingerprint, fb: Fingerprint, ha: frozenset, hb: frozenset,
+             *, meta_a, meta_b, k: int, min_shared: int, min_jaccard: float, min_containment: float,
+             min_tokens: int, evidence: int, drop: set = frozenset()) -> Similarity:
+    jaccard, cab, cba, containment, shared = _scores(ha, hb)
     warnings: list[str] = []
     for side, fp in (("a", fa), ("b", fb)):
         if fp.tokens < min_tokens:
             warnings.append(f"{side}-too-short:{fp.tokens}")
-    # the score uses the winnowed representatives; evidence needs the full k-gram sequence,
-    # because representatives are deliberately sparse and never adjacent
-    scored = (fa.hashes & fb.hashes) - drop
-    common = {h for _start, h in fa.kgrams} & {h for _start, h in fb.kgrams} - drop
+    # the score uses the winnowed representatives; evidence has to walk the full k-gram
+    # sequence, because representatives are deliberately sparse and never adjacent
+    common = ({h for _start, h in fa.kgrams} & {h for _start, h in fb.kgrams}) - drop
     if shared < min_shared:
         warnings.append(f"below-min-shared:{shared}")
         qualifies = False
     else:
         qualifies = fa.tokens >= min_tokens and fb.tokens >= min_tokens and (
             jaccard >= min_jaccard or containment >= min_containment)
-    spans, truncated = (shared_runs(fa, fb, common, evidence, k) if common else ([], False))
+    if evidence <= 0:
+        spans, truncated = [], False
+    else:
+        spans, truncated = (shared_runs(fa, fb, common, evidence, k) if common else ([], False))
     if truncated:
         warnings.append("evidence-truncated")
     if not spans and qualifies:
@@ -349,10 +389,10 @@ def compare_documents(a: Document, b: Document, *, k: int = DEFAULT_K, window: i
     """Compare two documents on their own (no corpus-level boilerplate filtering)."""
     fa = fingerprint(a, k=k, window=window, winnow=winnow)
     fb = fingerprint(b, k=k, window=window, winnow=winnow)
-    meta_a = Submission(path=a.path, user="unknown")
-    meta_b = Submission(path=b.path, user="unknown")
-    return _compare(a, b, fa, fb, meta_a=meta_a, meta_b=meta_b, drop=set(), k=k,
-                    min_shared=min_shared, min_jaccard=min_jaccard,
+    return _compare(a, b, fa, fb, fa.hashes, fb.hashes,
+                    meta_a=Submission(path=a.path, user="unknown"),
+                    meta_b=Submission(path=b.path, user="unknown"),
+                    k=k, min_shared=min_shared, min_jaccard=min_jaccard,
                     min_containment=min_containment, min_tokens=min_tokens, evidence=evidence)
 
 
@@ -423,13 +463,18 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
                     include_same_user: bool = True, include_cross_user: bool = True,
                     max_candidates: int | None = None, evidence: int = DEFAULT_EVIDENCE,
                     k: int = DEFAULT_K, window: int = DEFAULT_WINDOW, winnow: bool = True,
-                    keep_common: bool = False) -> SimilarityReport:
-    """Compare a set of submissions and group the pairs that share too much."""
+                    keep_common: bool = False, max_df: float = BOILERPLATE_DOC_RATIO) -> SimilarityReport:
+    """Compare a set of submissions and group the pairs that share too much.
+
+    ``max_df`` is the document frequency, as a fraction of the bucket, above which a k-gram is
+    treated as boilerplate: it appears in nearly every submission of that problem, so it says
+    nothing about whether two of them match.
+    """
     report = SimilarityReport(params={
         "k": k, "window": window, "min_jaccard": round(min_jaccard, 3),
         "min_containment": round(min_containment, 3), "min_shared": min_shared,
         "min_tokens": min_tokens, "winnow": winnow, "keep_common": keep_common,
-        "same_problem": same_problem, "same_language": same_language,
+        "same_problem": same_problem, "same_language": same_language, "max_df": round(max_df, 3),
     })
     if not submissions:
         return report
@@ -452,54 +497,97 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
         elif not fp.kgrams:
             report.warnings.append(f"no-kgrams:{sub.id}")
 
-    drop: set[int] = set()
-    if not keep_common and len(docs) >= BOILERPLATE_MIN_DOCS:
-        postings: dict[int, int] = {}
-        for fp in fps:
-            for h in fp.hashes:
-                postings[h] = postings.get(h, 0) + 1
-        cut = BOILERPLATE_DOC_RATIO * len(docs)
-        drop = {h for h, n in postings.items() if n > cut}
+    # Candidates are generated per (problem, language family) bucket, never globally: a
+    # boilerplate k-gram sitting in most of 2000 submissions would otherwise be counted
+    # 2000*1999/2 times, while submissions to different problems are never compared anyway.
+    buckets: dict[tuple, list[int]] = {}
+    for idx, sub in enumerate(subs):
+        key = (sub.problem if same_problem else None,
+               docs[idx].spec.family if same_language else None)
+        buckets.setdefault(key, []).append(idx)
+    n = len(subs)
+    kept: list[frozenset] = [fps[i].hashes for i in range(n)]
+    drops: list[frozenset] = [frozenset()] * n   # per bucket: which k-grams were treated as boilerplate
+    candidates: dict[int, int] = {}
+    filtered = 0
+    capped = 0
+    for key, members in sorted(buckets.items(), key=lambda item: str(item[0])):
+        members.sort()
+        if len(members) < 2:
+            continue
+        drop: set[int] = set()
+        if not keep_common and len(members) >= BOILERPLATE_MIN_DOCS:
+            df: dict[int, int] = {}
+            for i in members:
+                for h in fps[i].hashes:
+                    df[h] = df.get(h, 0) + 1
+            cut = max_df * len(members)
+            drop = {h for h, count in df.items() if count > cut}
+            filtered += len(drop)
         if drop:
-            report.warnings.append(f"boilerplate-filtered:{len(drop)}")
+            frozen = frozenset(drop)
+            for i in members:
+                kept[i] = fps[i].hashes - frozen
+                drops[i] = frozen
+        index: dict[int, list[int]] = {}
+        for i in members:
+            for h in kept[i]:
+                index.setdefault(h, []).append(i)
+        for holders in index.values():
+            if len(holders) > MAX_POSTINGS:
+                capped += 1
+                continue  # this k-gram cannot discriminate inside such a large bucket
+            for x in range(len(holders)):
+                left = holders[x] * n
+                for y in range(x + 1, len(holders)):
+                    code = left + holders[y]
+                    candidates[code] = candidates.get(code, 0) + 1
+    if filtered:
+        report.warnings.append(f"boilerplate-filtered:{filtered}")
+    if capped:
+        report.warnings.append(f"postings-capped:{capped}")
+    if same_problem:
+        untagged = sum(1 for sub in subs if not sub.problem)
+        if untagged:
+            report.warnings.append(f"no-problem-id:{untagged}(compared globally)")
+    if same_language and len(buckets) > len({key[0] for key in buckets}):
+        report.warnings.append(f"language-split:{len(buckets)}")
 
-    # candidate pairs through the inverted index: only docs sharing at least one representative
-    shared_count: dict[tuple[int, int], int] = {}
-    index: dict[int, list[int]] = {}
-    for i, fp in enumerate(fps):
-        for h in fp.hashes - drop:
-            index.setdefault(h, []).append(i)
-    for holders in index.values():
-        if len(holders) > 500:
-            continue  # a hash this common is already filtered or useless as a signal
-        for x in range(len(holders)):
-            for y in range(x + 1, len(holders)):
-                key = (holders[x], holders[y])
-                shared_count[key] = shared_count.get(key, 0) + 1
+    ordered = sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
+    if max_candidates is not None and len(ordered) > max_candidates:
+        report.warnings.append(f"candidates-truncated:{len(ordered) - max_candidates}")
+        ordered = ordered[:max_candidates]
 
-    candidates = sorted(shared_count, key=lambda pair: (-shared_count[pair], pair))
-    if max_candidates is not None and len(candidates) > max_candidates:
-        report.warnings.append(f"candidates-truncated:{len(candidates) - max_candidates}")
-        candidates = candidates[:max_candidates]
-
-    for i, j in candidates:
+    # The postings count for a pair *is* |ha ∩ hb| (a representative appears at most once per
+    # document), so both scores follow exactly from the counts we already have - no set work and
+    # no approximation.  Note containment cannot be bounded by the size ratio: for a subset copy
+    # it reaches 1.0 however different the sizes are, so pruning on ratio would lose real matches.
+    pruned_by_score = 0
+    for code, shared in ordered:
+        i, j = divmod(code, n)
+        if shared < min_shared:
+            continue
         sub_a, sub_b = subs[i], subs[j]
-        if same_problem and sub_a.problem and sub_b.problem and sub_a.problem != sub_b.problem:
-            continue
-        if same_language and docs[i].spec.family != docs[j].spec.family:
-            report.warnings.append(f"skipped-cross-language:{sub_a.id}+{sub_b.id}")
-            continue
         if sub_a.user == sub_b.user and not include_same_user:
             continue
         if sub_a.user != sub_b.user and not include_cross_user:
             continue
-        if shared_count[(i, j)] < min_shared:
+        sizes = (len(kept[i]), len(kept[j]))
+        smaller = min(sizes)
+        union = sizes[0] + sizes[1] - shared
+        containment = shared / smaller if smaller else 0.0
+        jaccard = shared / union if union else 0.0
+        if jaccard < min_jaccard and containment < min_containment:
+            pruned_by_score += 1
             continue
-        sim = _compare(docs[i], docs[j], fps[i], fps[j], meta_a=sub_a, meta_b=sub_b, drop=drop, k=k,
-                       min_shared=min_shared, min_jaccard=min_jaccard,
-                       min_containment=min_containment, min_tokens=min_tokens, evidence=evidence)
+        sim = _compare(docs[i], docs[j], fps[i], fps[j], kept[i], kept[j],
+                       meta_a=sub_a, meta_b=sub_b, k=k, min_shared=min_shared,
+                       min_jaccard=min_jaccard, min_containment=min_containment,
+                       min_tokens=min_tokens, evidence=evidence, drop=drops[i])
         if sim.qualifies:
             report.pairs.append(sim)
+    if pruned_by_score:
+        report.warnings.append(f"pruned-by-score:{pruned_by_score}")
 
     report.pairs.sort(key=lambda s: (-s.jaccard, -s.containment, s.a, s.b))
     report.clusters = _clusters(report.pairs)

@@ -16,6 +16,7 @@ from cf.similarity import (
     fingerprint,
     load_manifest,
     normalize,
+    read_document,
 )
 from tests.util import read_sample, sample_path
 
@@ -182,3 +183,94 @@ def test_results_are_serialisable_and_json_friendly():
     doc = report.to_dict()
     assert doc["version"] == 1 and doc["params"]["k"] == 7
     assert {s["id"] for s in doc["submissions"]} == {"p", "q"}
+
+
+def test_rolling_window_hash_matches_the_naive_polynomial():
+    from cf.similarity import BASE, MASK64, _window_hashes
+
+    codes = [i * 7919 + 3 for i in range(40)]
+    for k in (1, 2, 5, 7):
+        rolled = dict(_window_hashes(codes, k))
+        naive = {}
+        for start in range(0, len(codes) - k + 1):
+            h = 0
+            for j in range(k):
+                h = ((h * BASE) + codes[start + j]) & MASK64
+            naive[start] = h
+        assert rolled == naive, k
+
+
+def test_fingerprint_carries_rows_not_token_objects():
+    fp = fingerprint(build_document(BASE, "mem.cpp"))
+    assert not hasattr(fp, "norm")
+    assert len(fp.row_at) == fp.tokens            # one row per normalised token
+    assert min(fp.row_at) >= 1 and max(fp.row_at) <= fp.rows
+
+
+def test_zero_evidence_keeps_scores_but_skips_run_detection():
+    sim = compare(BASE, renamed(BASE), min_tokens=40, evidence=0)
+    assert sim.jaccard == 1.0 and sim.qualifies
+    assert sim.evidence == ()
+
+
+def test_a_subset_copy_survives_the_score_prefilter():
+    # the whole point of containment: a short file can sit entirely inside a long one even
+    # though jaccard is small, so the pre-filter must never judge a pair by its size ratio
+    head = BASE[: BASE.index("    void report")]
+    report = find_duplicates([Submission(path="b", id="big", text=BASE, problem="P"),
+                              Submission(path="s", id="small", text=head, problem="P")], min_tokens=20)
+    assert report.pairs, report.warnings
+    pair = report.pairs[0]
+    assert pair.jaccard < 0.5 < pair.containment, pair.to_dict()
+    assert pair.containment_ab >= 0.8 or pair.containment_ba >= 0.8
+
+
+def test_pairs_without_a_single_shared_kgram_never_become_candidates():
+    tiny = Submission(path="t", id="tiny", text="int main(){return 0;}\n", problem="P")
+    big = Submission(path="b", id="big", text=BASE, problem="P")
+    assert find_duplicates([tiny, big], min_tokens=1).pairs == []
+    unbounded = find_duplicates([tiny, big], min_tokens=1, min_jaccard=0.0,
+                                min_containment=0.0, min_shared=1)
+    assert unbounded.pairs == [], "they share no k-gram, so no candidate is even formed"
+
+
+def test_max_df_controls_the_boilerplate_cut():
+    head = "#include <bits/stdc++.h>\nusing namespace std;\nint main(){\n"
+    bodies = ["    int n; cin >> n; cout << n << endl;\n}\n",
+              "    int m; cin >> m; cout << m << endl;\n}\n",
+              "    int k; cin >> k; cout << k << endl;\n}\n"]
+    subs = [Submission(path=f"s{i}", id=f"s{i}", user=f"u{i}", problem="P",
+                        text=head + bodies[i % 3]) for i in range(30)]
+    strict = find_duplicates(subs, min_tokens=20, max_df=0.2)
+    loose = find_duplicates(subs, min_tokens=20, keep_common=True)
+    assert len(strict.pairs) <= len(loose.pairs)
+    assert any(w.startswith("boilerplate-filtered") for w in strict.warnings), strict.warnings
+    assert not any(w.startswith("boilerplate-filtered") for w in loose.warnings)
+
+
+def test_the_optimised_pipeline_matches_brute_force_pairwise(tmp_path):
+    """Grouping, posting counts and the score pre-filter must not change which pairs are reported."""
+    import itertools
+
+    base = read_sample("cpp_knr.cpp")
+    variants = [base, base.replace("values", "nums"), base.replace("total", "acc"),
+                read_sample("cpp_allman.cpp"), read_sample("mixed.cpp"),
+                read_sample("go_style.go"), read_sample("js_single.js"),
+                base.replace("cache_", "memo_")]
+    subs = []
+    for i, text in enumerate(variants):
+        suffix = ".go" if "func main" in text else (".js" if "export" in text else ".cpp")
+        path = tmp_path / f"v{i}{suffix}"
+        path.write_text(text, encoding="utf-8")
+        subs.append(Submission(path=str(path), id=f"v{i}", user=f"u{i % 4}",
+                               problem=f"P{i // 4}"))
+    kwargs = dict(min_tokens=20, min_shared=2)
+    fast = {(min(p.a, p.b), max(p.a, p.b)) for p in find_duplicates(subs, **kwargs).pairs}
+    slow = set()
+    for a, b in itertools.combinations(subs, 2):
+        if a.problem != b.problem:
+            continue
+        sim = compare_documents(read_document(a), read_document(b), **kwargs)
+        if sim.qualifies:
+            slow.add((min(a.id, b.id), max(a.id, b.id)))
+    assert fast == slow, (fast - slow, slow - fast)
