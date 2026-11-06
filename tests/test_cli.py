@@ -412,3 +412,36 @@ def test_audit_combines_duplicates_style_and_signals(capsys, tmp_path, store):
     reasons = {f["id"]: f["reasons"] for f in payload["flags"]}
     assert "external-signal" in reasons["bob-P"] and "cross-user-duplicate" in reasons["bob-P"]
     assert payload["external_signals"], "signals are passed through unchanged"
+
+
+def help_text(capsys, argv):
+    """``-h`` prints and exits 0, so it never returns through main()."""
+    with pytest.raises(SystemExit) as excinfo:
+        main(argv)
+    assert excinfo.value.code == 0, argv
+    return capsys.readouterr().out
+
+
+def test_command_help_renders_in_both_languages(capsys):
+    """A literal "%" in a help string used to kill ``-h``: argparse interpolates help as a format.
+
+    Commands are walked from the parser rather than listed, so a new one cannot ship broken help.
+    """
+    import argparse
+
+    from cf.cli import build_parser
+
+    sub = next(a for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+    targets = [[name] for name in sorted(sub.choices)]
+    nested = next((a for a in sub.choices["profile"]._actions
+                   if isinstance(a, argparse._SubParsersAction)), None)
+    targets += [["profile", name] for name in sorted(nested.choices)]
+    assert len(targets) >= 9, targets
+    for target in targets:
+        for locale in ("en", "zh"):
+            out = help_text(capsys, ["-L", locale, *target, "-h"])
+            assert out.startswith("usage:") and target[-1] in out, (target, locale)
+
+
+def test_percent_sign_in_help_survives(capsys):
+    assert "80% of the corpus" in help_text(capsys, ["dup", "-h"])

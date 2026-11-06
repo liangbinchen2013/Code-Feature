@@ -437,16 +437,33 @@ def add_common(parser: argparse.ArgumentParser, files_help: str) -> None:
     parser.add_argument("--json", action="store_true", help=t("h.json"))
 
 
+class _Formatter(argparse.RawDescriptionHelpFormatter):
+    """Help text is translated prose, never a format string.
+
+    argparse runs ``help % params`` over every option's help, so the ``%`` in "over 80% of the
+    corpus" raises TypeError and the whole ``-h`` dies.  Nothing in this CLI uses argparse's
+    own ``{default}`` substitution - ``t()`` fills those in before argparse ever sees them.
+    """
+
+    def _expand_help(self, action):
+        return self._get_help_string(action) or ""
+
+
+class _Parser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("formatter_class", _Formatter)
+        super().__init__(*args, **kwargs)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="cf",
         description=t("h.summary"),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=EPILOG[get_locale()],
     )
     parser.add_argument("--version", action="version", version=f"cf {__version__}")
     parser.add_argument("-L", "--msg-lang", choices=("en", "zh"), default=None, help=t("h.msg_lang"))
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
 
     p = sub.add_parser("extract", help=t("h.lh.extract"))
     add_common(p, t("h.files"))
@@ -469,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("profile", help=t("h.lh.profile"))
-    subp = p.add_subparsers(dest="action", required=True)
+    subp = p.add_subparsers(dest="action", required=True, parser_class=_Parser)
 
     def profile_flags(sp):
         sp.add_argument("--store", help=t("h.store", default=DEFAULT_STORE))
@@ -521,8 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_format)
 
     p = sub.add_parser("dup", help=t("h.lh.dup"),
-                       description=t("h.dup.summary"),
-                       formatter_class=argparse.RawDescriptionHelpFormatter)
+                       description=t("h.dup.summary"))
     p.add_argument("files", nargs="*", help=t("h.dup.files"))
     p.add_argument("--manifest", help=t("h.dup.manifest"))
     p.add_argument("--store", help=t("h.store", default=DEFAULT_STORE))
@@ -551,8 +567,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_dup)
 
     p = sub.add_parser("similar", help=t("h.lh.similar"),
-                       description=t("h.similar.summary"),
-                       formatter_class=argparse.RawDescriptionHelpFormatter)
+                       description=t("h.similar.summary"))
     p.add_argument("files", nargs="*", help=t("h.similar.files"))
     p.add_argument("--lang", help=t("h.lang"))
     p.add_argument("--json", action="store_true", help=t("h.json"))
@@ -567,8 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_similar)
 
     p = sub.add_parser("audit", help=t("h.lh.audit"),
-                       description=t("h.audit.summary"),
-                       formatter_class=argparse.RawDescriptionHelpFormatter)
+                       description=t("h.audit.summary"))
     p.add_argument("files", nargs="*", help=t("h.dup.files"))
     p.add_argument("--manifest", help=t("h.dup.manifest"))
     p.add_argument("--store", help=t("h.audit.store"))
