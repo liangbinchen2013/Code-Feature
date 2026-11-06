@@ -6,6 +6,7 @@ Columns are padded by *display* width: Chinese glyphs take two terminal cells, s
 from __future__ import annotations
 
 import difflib
+import sys
 import time
 from unicodedata import east_asian_width
 
@@ -383,3 +384,60 @@ def render_audit(report) -> str:
     lines.append("")
     lines.append(t("r.audit_note"))
     return "\n".join(lines)
+
+
+class ProgressPrinter:
+    """Stream a long pass's progress to stderr, one line per update, with an estimate of the rest.
+
+    The estimate is the stage's own rate, from the counts the pass reports as it works: there is no
+    single overall percentage to show, because how long a pass spends lexing versus taking evidence
+    depends on how many pairs the thresholds let through, so a combined figure would be a guess.
+    stdout is never touched, so a ``--json`` report stays parseable while these lines scroll.
+
+    Updates are ordinary newline-terminated lines, not an in-place rewrite: a half-written line
+    would survive into an error message if the pass raised, and a log file cannot show one anyway.
+    """
+
+    def __init__(self, stream=None, every: float = 0.2):
+        self.stream = stream if stream is not None else sys.stderr
+        self.every = every
+        self._started = time.perf_counter()
+        # counted from the start, so the first line already carries a rate worth believing
+        self._last = self._started
+
+    def event(self, progress) -> None:
+        """Hand this to ``find_duplicates(on_progress=...)``; it prints on its own cadence.
+
+        A stage younger than the cadence has no rate to divide by yet, so its first update waits
+        for one: otherwise the estimate reads "~0.0s left" when a pool is still starting up, which
+        is the kind of number a human would act on.
+        """
+        now = time.perf_counter()
+        done, total = progress.done, progress.total
+        if not total or (done < total and (now - self._last < self.every
+                                           or progress.elapsed < self.every)):
+            return
+        self._last = now
+        eta = progress.elapsed / done * (total - done)
+        self._write(t("r.progress", stage=self._stage(progress.stage), done=done, total=total,
+                      pct=100 * done // total, elapsed=f"{progress.elapsed:.1f}",
+                      eta=f"{eta:.1f}"))
+
+    def finish(self, files: int, pairs: int) -> None:
+        """The last line, so a reader can tell the pass ended instead of just stopping printing."""
+        self._write(t("r.progress_done", files=files, pairs=pairs,
+                      seconds=f"{time.perf_counter() - self._started:.1f}"))
+
+    @staticmethod
+    def _stage(stage: str) -> str:
+        if stage == "lex":
+            return t("r.progress.lex")
+        if stage == "evidence":
+            return t("r.progress.evidence")
+        if stage == "style":
+            return t("r.progress.style")
+        return stage
+
+    def _write(self, text: str) -> None:
+        self.stream.write(text + "\n")
+        self.stream.flush()

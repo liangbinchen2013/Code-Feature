@@ -84,7 +84,7 @@ cf.audit.build_audit(submissions, store=..., signals=...) -> AuditReport
 | `cf profile <子命令>` | 档案管理 | `add/update/list/show/delete/rename/export/import` |
 | `cf format FILES…` | 重新排版 | 默认只预览；`--write`/`--check`/`--diff`/`--rules`/`--observed-only`/`--no-wrap`/`--eol` |
 | `cf rules` / `cf languages` | 查词表与支持度 | |
-| `cf dup [--manifest M] FILES…` | 多用户查重与聚类 | `--min-score/--min-containment/--min-shared/--min-tokens/--k/--window/--no-winnow/--keep-common/--cross-user/--same-user/--all-problems/--cross-language/--top/--evidence/--fail-on/--max-candidates` |
+| `cf dup [--manifest M] FILES…` | 多用户查重与聚类 | `--min-score/--min-containment/--min-shared/--min-tokens/--k/--window/--no-winnow/--keep-common/--cross-user/--same-user/--all-problems/--cross-language/--top/--evidence/--fail-on/--max-candidates/--jobs(-j)/--progress` |
 | `cf similar A B` | 只比一对文件 | 不用 manifest，不按阈值决定退出码 |
 | `cf audit --manifest M --store S [--signals X]` | 查重 + 与本人档案的偏离 + 外部信号 | 信号按 `id`/`path` 原样合并，内核不解释 |
 
@@ -184,6 +184,16 @@ Python 支持最全（`tokenize` + `ast` 双路），其余语言共用一套 cl
 * 一个 k-gram 在片内覆盖超过 `--max-df`（默认 0.8）或 `MAX_POSTINGS=256` 份时按模板头
   剔除并计入 `boilerplate-filtered` / `postings-capped`，因为它对区分毫无贡献。
 * 报告只列达标配对；`--evidence 0` 跳过行段扫描，是明显更快的一次遍历。
+* **`--progress` 是给大批量用的，默认关。** 开了才把进度流式写到 **stderr**（stdout 一个字都不
+  动，`--json` 照旧可解析），每行报某一阶段的已完成/总数、已用时间与按该阶段自身速率算的预估。
+  刻意**不给"总百分比"**：一轮里词法与取证各占多少取决于阈值放过多少对，合成一个数字就是猜。
+  `-j` 打开时按分片落地累计上报，粒度是一片而不是一个文件/一对。
+
+  ```
+  progress: read + fingerprint 600/2000 (30%), 0.2s elapsed, ~0.5s left
+  progress: evidence 10530/16390 (64%), 1.1s elapsed, ~0.6s left
+  progress: done, 2000 file(s), 16390 qualifying pair(s), 3.7s
+  ```
 * 阈值放宽会让配对数按人数超线性增长，这是工作量而不是缺陷：N=4000 时 4769 对配对
   本身就要逐对取证。
 
@@ -209,7 +219,7 @@ Python 版本发二进制"，所以这一轮先做 `-j`，把不需要新依赖�
 
 ```
 pip install -e .
-python -m pytest -q                 # 269 个测试
+python -m pytest -q                 # 272 个测试
 python -m cf.cli --help             # 未安装也可以直接跑
 cf-demo                             # 可选的 tkinter 演示（不属于内核）
 ```

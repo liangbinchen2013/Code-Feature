@@ -445,3 +445,53 @@ def test_command_help_renders_in_both_languages(capsys):
 
 def test_percent_sign_in_help_survives(capsys):
     assert "80% of the corpus" in help_text(capsys, ["dup", "-h"])
+
+
+def _three_submission_manifest(tmp_path):
+    _a, _b, _c = _pair_corpus(tmp_path)
+    return _manifest(tmp_path, [
+        {"id": "alice-P", "user": "alice", "problem": "P", "path": "alice.cpp"},
+        {"id": "bob-P", "user": "bob", "problem": "P", "path": "bob.cpp"},
+        {"id": "carol-P", "user": "carol", "problem": "P", "path": "carol.cpp"}])
+
+
+def test_progress_flag_streams_estimates_without_touching_the_report(capsys, tmp_path):
+    """--progress is opt-in, writes to stderr, and must not change a byte of the report."""
+    man = _three_submission_manifest(tmp_path)
+    code, out, err = run(capsys, ["dup", "--manifest", man, "--min-tokens", "40",
+                                  "--progress", "--json"])
+    assert code == 1, err
+    _code, quiet_out, quiet_err = run(capsys, ["dup", "--manifest", man, "--min-tokens", "40",
+                                               "--json"])
+    assert out == quiet_out, "the same report with and without the progress stream"
+    assert quiet_err == "", "no progress line escapes into stderr unless it was asked for"
+    lines = [ln for ln in err.splitlines() if ln.startswith("progress:")]
+    assert len(lines) >= 2, err
+    assert "read + fingerprint 3/3 (100%)" in err, err
+    assert "evidence" in err, err
+    assert f"progress: done, {len(json.loads(out)['submissions'])} file(s)" in err, err
+
+
+def test_progress_printer_holds_an_estimate_until_there_is_a_rate():
+    """A stage younger than its own cadence has no rate to divide by, so it stays quiet."""
+    import io
+    import time
+
+    from cf.report import ProgressPrinter
+    from cf.similarity import ProgressEvent
+
+    stream = io.StringIO()
+    printer = ProgressPrinter(stream=stream, every=0.05)
+    printer.event(ProgressEvent("lex", 10, 100, 0.0))
+    assert stream.getvalue() == "", "no estimate to show yet"
+    time.sleep(0.06)
+    printer.event(ProgressEvent("lex", 10, 100, 0.2))
+    assert "read + fingerprint 10/100" in stream.getvalue()
+    assert "~1.8s left" in stream.getvalue(), stream.getvalue()
+
+    closed = io.StringIO()
+    second = ProgressPrinter(stream=closed, every=0.05)
+    second.event(ProgressEvent("style", 4, 4, 0.0))   # a finished stage always gets its line
+    assert "style comparison 4/4 (100%)" in closed.getvalue()
+    second.finish(4, 2)
+    assert "progress: done, 4 file(s), 2 qualifying pair(s)" in closed.getvalue()

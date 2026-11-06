@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 from .consistency import analyze
 from .document import build_document
-from .similarity import SimilarityError, SimilarityReport, Submission, find_duplicates, read_document
+from .similarity import (ProgressEvent, SimilarityError, SimilarityReport, Submission,
+                         find_duplicates, read_document)
 from .store import ProfileStore
 
 SCHEMA_VERSION = 1
@@ -104,11 +106,16 @@ def _signal_keys(signal: dict) -> set[str]:
 
 
 def build_audit(submissions: list[Submission], *, store: ProfileStore | None = None,
-                signals=None, min_evidence: int = 3, **dup_kwargs) -> AuditReport:
-    """Run the duplicate pass, the per-user style comparison, and merge in external signals."""
+                signals=None, min_evidence: int = 3, on_progress=None, **dup_kwargs) -> AuditReport:
+    """Run the duplicate pass, the per-user style comparison, and merge in external signals.
+
+    ``on_progress`` hears from both long phases: the duplicate pass reports its own stages, and the
+    style comparison reports ``style`` per submission - it re-reads every file, so leaving it out
+    would look like the pass had stalled.
+    """
     report = AuditReport()
     subs = sorted(submissions, key=lambda s: s.id)
-    report.duplicates = find_duplicates(subs, **dup_kwargs)
+    report.duplicates = find_duplicates(subs, on_progress=on_progress, **dup_kwargs)
     report.warnings.extend(report.duplicates.warnings)
 
     by_id = {s.id: s for s in subs}
@@ -135,7 +142,13 @@ def build_audit(submissions: list[Submission], *, store: ProfileStore | None = N
 
     if store is None:
         report.warnings.append("no-profile-store:style deviation skipped")
-    for sub in subs:
+    style_started = time.perf_counter()
+    for position, sub in enumerate(subs, 1):
+        # counted as examined, before this submission's branch: the skips are work too, and a
+        # progress line that only moved on the slow path would stall in a corpus with no profiles
+        if on_progress is not None:
+            on_progress(ProgressEvent("style", position, len(subs),
+                                      time.perf_counter() - style_started))
         profile = store.get(sub.user) if store is not None else None
         if profile is None:
             if store is not None:

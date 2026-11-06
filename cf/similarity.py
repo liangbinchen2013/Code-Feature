@@ -13,6 +13,7 @@ import itertools
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
 from .document import Document, build_document, normalize as normalize_text
@@ -183,6 +184,24 @@ class SimilarityReport:
             "clusters": [c.to_dict() for c in self.clusters],
             "warnings": list(self.warnings),
         }
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    """One streaming progress tick, so a big batch can show an estimate while it runs.
+
+    ``stage`` is ``lex`` (files read, fingerprinted and counted) or ``evidence`` (pairs whose
+    matched rows were taken); :func:`cf.audit.build_audit` adds ``style`` for its own second phase.
+    ``done``/``total`` count units *of that stage only*, and ``elapsed`` is seconds since that stage
+    started.  There is deliberately no single overall percentage: the stages cost wildly different
+    amounts per unit and which one dominates depends on how many pairs the thresholds let through,
+    so a combined figure would be a guess dressed up as a measurement.  A caller wanting an
+    estimate can use ``elapsed / done * (total - done)``.
+    """
+    stage: str
+    done: int
+    total: int
+    elapsed: float
 
 
 # -- normalisation ------------------------------------------------------------
@@ -491,13 +510,15 @@ def _shard_of(sub: Submission, same_problem: bool, same_language: bool) -> tuple
     return (sub.problem if same_problem else None, family)
 
 
-def _lex_shard(subs: list[Submission], params: dict):
+def _lex_shard(subs: list[Submission], params: dict, report=None):
     """Lex one shard and split off the k-grams that say nothing about matching in this shard."""
     docs, fps = [], []
     for sub in subs:
         doc = read_document(sub)
         docs.append(doc)
         fps.append(fingerprint(doc, k=params["k"], window=params["window"], winnow=params["winnow"]))
+        if report is not None:
+            report("lex", 1)
     kept = [f.hashes for f in fps]
     if params["keep_common"] or len(subs) < BOILERPLATE_MIN_DOCS:
         return docs, fps, kept, frozenset(), 0
@@ -520,9 +541,10 @@ def _count_shard(payload: dict) -> dict:
     thing sharded or not, and a per-shard budget would quietly multiply it by the number of shards.
     """
     subs, params, gidx = payload["subs"], payload["params"], payload["gidx"]
+    report = payload.get("report")      # only ever present inline: a callback cannot be pickled
     for stale in [k for k in _SHARD_CACHE if k[0] != payload["run"]]:
         del _SHARD_CACHE[stale]      # the previous run's shards: this run's scoring pops as it goes
-    docs, fps, kept, frozen, filtered = _lex_shard(subs, params)
+    docs, fps, kept, frozen, filtered = _lex_shard(subs, params, report)
     index: dict[int, list[int]] = {}
     for pos, hashes in enumerate(kept):
         for h in hashes:
@@ -551,14 +573,16 @@ def _count_shard(payload: dict) -> dict:
             short.append((sub.id, f"too-short:{sub.id}:{fp.tokens}"))
         elif not fp.kgrams:
             short.append((sub.id, f"no-kgrams:{sub.id}"))
-    return {"candidates": list(candidates.items()),
+    return {"ix": payload["ix"], "files": len(subs),
+            "candidates": list(candidates.items()),
             "sizes": [(gidx[p], len(kept[p])) for p in range(len(subs))],
             "infos": infos, "short": short, "filtered": filtered, "capped": capped}
 
 
-def _score_shard(payload: dict) -> list:
+def _score_shard(payload: dict) -> dict:
     """Take evidence for the pairs the caller kept, in the shard that already lexed them."""
     subs, params, gidx = payload["subs"], payload["params"], payload["gidx"]
+    report = payload.get("report")
     state = _SHARD_CACHE.pop((payload["run"], payload["key"]), None)
     if state is None:  # the shard was never counted here: a recycled worker, or a direct call
         docs, fps, kept, frozen, _f = _lex_shard(subs, params)
@@ -566,7 +590,7 @@ def _score_shard(payload: dict) -> list:
         docs, fps, kept, frozen = state[1], state[2], state[3], state[4]
     pos = {g: p for p, g in enumerate(gidx)}
     out = []
-    for i, j, _shared in payload["pairs"]:
+    for position, (i, j, _shared) in enumerate(payload["pairs"], 1):
         pi, pj = pos[i], pos[j]
         sim = _compare(docs[pi], docs[pj], fps[pi], fps[pj], kept[pi], kept[pj],
                        meta_a=subs[pi], meta_b=subs[pj], k=params["k"],
@@ -575,7 +599,9 @@ def _score_shard(payload: dict) -> list:
                        evidence=params["evidence"], drop=frozen)
         if sim.qualifies:
             out.append(sim)
-    return out
+        if report is not None:
+            report("evidence", 1)
+    return {"ix": payload["ix"], "scored": len(payload["pairs"]), "value": out}
 
 
 def _pool_for(jobs: int, count: int):
@@ -591,12 +617,23 @@ def _pool_for(jobs: int, count: int):
     return multiprocessing.Pool(min(jobs, count))
 
 
-def _spread(work, payloads: list, pool):
-    """Run a shard pass inline or through the pool.  Results keep payload order, so sharding
-    cannot reorder anything the report shows."""
+def _spread(work, payloads: list, pool, on_landing=None):
+    """Run a shard pass inline or across processes, in payload order either way.
+
+    With a pool the shards are taken as they land (``imap_unordered``) so progress reflects reality
+    rather than the order the work was handed out, and each result is put back at its own index -
+    the report must not depend on which cpu finished first.  ``on_landing`` is the parent's chance
+    to count what a finished shard did; inline there is nothing to land, the pass reports every
+    file and pair itself as it goes.
+    """
     if pool is None:
         return [work(p) for p in payloads]
-    return pool.map(work, payloads, chunksize=1)
+    out: list = [None] * len(payloads)
+    for result in pool.imap_unordered(work, payloads, chunksize=1):
+        if on_landing is not None:
+            on_landing(result)
+        out[result["ix"]] = result
+    return out
 
 
 def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAULT_MIN_JACCARD,
@@ -607,7 +644,7 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
                     max_candidates: int | None = None, evidence: int = DEFAULT_EVIDENCE,
                     k: int = DEFAULT_K, window: int = DEFAULT_WINDOW, winnow: bool = True,
                     keep_common: bool = False, max_df: float = BOILERPLATE_DOC_RATIO,
-                    jobs: int = 1) -> SimilarityReport:
+                    jobs: int = 1, on_progress=None) -> SimilarityReport:
     """Compare a set of submissions and group the pairs that share too much.
 
     ``max_df`` is the document frequency, as a fraction of the shard, above which a k-gram is
@@ -617,6 +654,10 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
     ``jobs`` spreads the shards over processes: 1 keeps everything in this process, 0 uses every
     cpu, any larger number caps it.  It changes scheduling only - the report is identical either
     way, which ``test_jobs_matches_serial`` pins down.
+
+    ``on_progress`` receives a :class:`ProgressEvent` per unit of work (per file while lexing, per
+    pair while taking evidence) and, with ``jobs`` above 1, one aggregate per shard as it lands.
+    It is a hook for a caller showing a estimate to a waiting human; it never changes the report.
     """
     report = SimilarityReport(params={
         "k": k, "window": window, "min_jaccard": round(min_jaccard, 3),
@@ -648,13 +689,32 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
         owner[idx] = key
     run = next(_RUN_IDS)
     payloads = []
-    for key in sorted(shards, key=str):
+    for position, key in enumerate(sorted(shards, key=str)):
         members = sorted(shards[key])
-        payloads.append({"run": run, "key": key, "gidx": members, "params": params,
+        payloads.append({"ix": position, "run": run, "key": key, "gidx": members, "params": params,
                          "subs": [subs[i] for i in members]})
+    # Progress is counted in the units each stage really costs: one file read and fingerprinted,
+    # one pair evidenced.  Inline those arrive one at a time; with a pool only whole shards land,
+    # so the same counter is then fed a shard's totals as each one comes back.
+    done: dict[str, int] = {}
+    totals: dict[str, int] = {"lex": n}
+    started: dict[str, float] = {}
+
+    def tick(stage: str, units: int) -> None:
+        if on_progress is None or not totals.get(stage):
+            return
+        started.setdefault(stage, time.perf_counter())
+        done[stage] = done.get(stage, 0) + units
+        on_progress(ProgressEvent(stage, done[stage], totals[stage],
+                                  time.perf_counter() - started[stage]))
+
     workers = _pool_for((os.cpu_count() or 1) if jobs < 1 else jobs, len(payloads))
+    if workers is None:
+        for payload in payloads:
+            payload["report"] = tick      # a callback cannot be pickled into a worker
     try:
-        counted = _spread(_count_shard, payloads, workers)
+        counted = _spread(_count_shard, payloads, workers,
+                          on_landing=None if workers is None else lambda landed: tick("lex", landed["files"]))
         candidates: dict[int, int] = {}
         sizes: dict[int, int] = {}
         short: list[tuple[str, str]] = []
@@ -716,15 +776,19 @@ def find_duplicates(submissions: list[Submission], *, min_jaccard: float = DEFAU
             pairs = todo.get(payload["key"])
             if pairs:
                 item = dict(payload)
+                item["ix"] = len(scoring)    # its own slot: the scoring list is not the shard list
                 item["pairs"] = pairs
                 scoring.append(item)
-        chunks = _spread(_score_shard, scoring, workers)
+        totals["evidence"] = sum(len(item["pairs"]) for item in scoring)
+        chunks = _spread(_score_shard, scoring, workers,
+                         on_landing=None if workers is None
+                         else lambda landed: tick("evidence", landed["scored"]))
     finally:
         if workers is not None:
             workers.close()
             workers.join()
     for chunk in chunks:
-        report.pairs.extend(chunk)
+        report.pairs.extend(chunk["value"])
     if pruned_by_score:
         report.warnings.append(f"pruned-by-score:{pruned_by_score}")
 

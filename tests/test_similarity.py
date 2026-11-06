@@ -276,13 +276,8 @@ def test_the_optimised_pipeline_matches_brute_force_pairwise(tmp_path):
     assert fast == slow, (fast - slow, slow - fast)
 
 
-def test_jobs_matches_serial(tmp_path):
-    """Spreading the shards over processes may change scheduling, never the report.
-
-    The parallel pass counts candidates per process and re-merges them in the parent, so this
-    compares the whole report - pairs, evidence, submission info and every warning counter - not
-    just the pair ids.  max_candidates is in the list because it truncates globally, across shards.
-    """
+def _corpus(tmp_path):
+    """Eight submissions over four problems: enough shards and pairs to exercise every pass."""
     texts = [BASE, renamed(BASE), BASE.replace("cache_", "memo_"), read_sample("cpp_allman.cpp"),
              read_sample("mixed.cpp"), read_sample("cpp_allman.cpp").replace("values", "nums"),
              BASE.replace("total", "acc"), read_sample("cpp_allman.cpp").replace("total", "acc")]
@@ -292,10 +287,50 @@ def test_jobs_matches_serial(tmp_path):
         path = tmp_path / f"s{i}{suffix}"
         path.write_text(text, encoding="utf-8")
         subs.append(Submission(path=str(path), id=f"s{i}", user=f"u{i % 3}", problem=f"P{i % 4}"))
+    return subs
+
+
+def test_jobs_matches_serial(tmp_path):
+    """Spreading the shards over processes may change scheduling, never the report.
+
+    The parallel pass counts candidates per process and re-merges them in the parent, so this
+    compares the whole report - pairs, evidence, submission info and every warning counter - not
+    just the pair ids.  max_candidates is in the list because it truncates globally, across shards.
+    """
+    subs = _corpus(tmp_path)
     for kwargs in (dict(min_tokens=20, min_shared=2), dict(min_tokens=20, min_shared=2, evidence=0),
                    dict(min_tokens=20, max_candidates=3)):
         serial = find_duplicates(subs, jobs=1, **kwargs).to_dict()
         assert find_duplicates(subs, jobs=2, **kwargs).to_dict() == serial, kwargs
+
+
+def test_progress_events_reach_every_stage_total(tmp_path):
+    """A caller watching progress must be able to trust the counts, and the report must not change."""
+    subs = _corpus(tmp_path)
+    kwargs = dict(min_tokens=20, min_shared=2)
+    events = []
+    loud = find_duplicates(subs, jobs=1, on_progress=events.append, **kwargs).to_dict()
+    assert find_duplicates(subs, jobs=1, **kwargs).to_dict() == loud, "a hook cannot change results"
+
+    stages = {}
+    for event in events:
+        assert event.done <= event.total and event.elapsed >= 0, event
+        stages.setdefault(event.stage, []).append(event)
+    assert sorted(stages) == ["evidence", "lex"], sorted(stages)
+    for stage, sequence in stages.items():
+        assert [e.done for e in sequence] == list(range(1, len(sequence) + 1)), stage
+        assert sequence[-1].done == sequence[-1].total, (stage, sequence[-1])
+        assert all(a.elapsed <= b.elapsed for a, b in zip(sequence, sequence[1:])), stage
+        assert len({e.total for e in sequence}) == 1, stage
+    assert stages["lex"][-1].total == len(subs)
+    assert stages["evidence"][-1].total >= len(loud["pairs"]), "evidence covers the pairs examined"
+
+    pooled = []
+    find_duplicates(subs, jobs=2, on_progress=pooled.append, **kwargs)
+    assert {e.stage for e in pooled} == {"lex", "evidence"}
+    assert max(e.done for e in pooled if e.stage == "lex") == len(subs), "shards must add up"
+    assert max(e.done for e in pooled if e.stage == "evidence") == stages["evidence"][-1].total
+    assert len(pooled) < len(events), "a pooled run reports whole shards, not single units"
 
 
 def test_the_shard_key_agrees_with_the_language_actually_lexed(tmp_path):

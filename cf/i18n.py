@@ -108,6 +108,14 @@ _MESSAGES: list[tuple[str, str, str]] = [
     ("r.dup_cluster_row", "  {cid}  users={users}  files={size}  max J={jaccard}",
      "  {cid}  用户={users}  份数={size}  最高 J={jaccard}"),
     ("r.dup_warnings", "warnings:", "提示："),
+    # -- progress stream (stderr, only with --progress) -----------------------
+    ("r.progress", "progress: {stage} {done}/{total} ({pct}%), {elapsed}s elapsed, ~{eta}s left",
+     "进度：{stage} {done}/{total}（{pct}%），已用 {elapsed}s，预计还要 ~{eta}s"),
+    ("r.progress.lex", "read + fingerprint", "读取 + 指纹"),
+    ("r.progress.evidence", "evidence", "取证"),
+    ("r.progress.style", "style comparison", "风格对照"),
+    ("r.progress_done", "progress: done, {files} file(s), {pairs} qualifying pair(s), {seconds}s",
+     "进度：完成，{files} 份文件，{pairs} 对达标，用时 {seconds}s"),
     # -- audit report --------------------------------------------------------
     ("r.audit_head", "audit: {duplicates} duplicate pair(s) over {submissions} submission(s)",
      "审计：{submissions} 份提交，{duplicates} 对重复嫌疑"),
@@ -301,6 +309,8 @@ _MESSAGES: list[tuple[str, str, str]] = [
     ("h.dup.jobs", "spread the comparison over this many processes; 0 uses every cpu "
                     "(the report is identical either way)",
      "把比较分到这么多个进程，0 表示用满所有 cpu（两种方式的结果完全一致）"),
+    ("h.dup.progress", "stream progress and an estimate of what is left to stderr",
+     "把进度与剩余时间预估输出到 stderr"),
     ("h.dup.top", "maximum pairs in the text report (JSON always lists all qualifying pairs)",
      "文本报告最多列出几对（JSON 始终包含全部达标配对）"),
     ("h.dup.all", "print every qualifying pair", "打印全部达标配对"),

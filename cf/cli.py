@@ -20,6 +20,7 @@ from .format import FormatOptions, Formatter
 from .i18n import ENV_VAR, get_locale, set_locale, t
 from .profile import FEATURE_SPECS, Profile
 from .report import (
+    ProgressPrinter,
     render_consistency,
     render_duplicates,
     render_format,
@@ -286,6 +287,7 @@ def cmd_format(args) -> int:
 
 def cmd_dup(args) -> int:
     subs = _submissions_from_args(args)
+    progress = ProgressPrinter() if args.progress else None
     report = find_duplicates(
         subs,
         min_jaccard=args.min_score,
@@ -304,7 +306,10 @@ def cmd_dup(args) -> int:
         keep_common=args.keep_common,
         max_df=args.max_df,
         jobs=args.jobs,
+        on_progress=progress.event if progress else None,
     )
+    if progress:
+        progress.finish(len(report.submissions), len(report.pairs))
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
     else:
@@ -358,6 +363,7 @@ def _submissions_from_args(args) -> list[Submission]:
 def cmd_audit(args) -> int:
     subs = _submissions_from_args(args)
     store = ProfileStore(args.store)
+    progress = ProgressPrinter() if args.progress else None
     report = build_audit(
         subs,
         store=store,
@@ -376,7 +382,10 @@ def cmd_audit(args) -> int:
         keep_common=args.keep_common,
         max_df=args.max_df,
         jobs=args.jobs,
+        on_progress=progress.event if progress else None,
     )
+    if progress:
+        progress.finish(len(report.duplicates.submissions), len(report.duplicates.pairs))
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
     else:
@@ -413,6 +422,7 @@ EPILOG = {
         "  cf format --profile bin.json < main.c            read stdin, write stdout\n"
         "  cf -L zh check src/*.py                          report in Chinese\n"
         "  cf dup --manifest subs.json                      find cross-user duplicates\n"
+        "  cf dup --manifest subs.json -j 0 --progress      a big batch: spread it, stream progress\n"
         "  cf similar alice.cpp bob.cpp                     score one pair\n"
     ),
     "zh": (
@@ -425,6 +435,7 @@ EPILOG = {
         "  cf format --profile bin.json < main.c            标准输入进、标准输出出\n"
         "  cf -L zh check src/*.py                          用中文输出提示\n"
         "  cf dup --manifest subs.json                      在多用户提交里查找重复\n"
+        "  cf dup --manifest subs.json -j 0 --progress      大批量：分满 cpu 并流式输出进度\n"
         "  cf similar alice.cpp bob.cpp                     只比较一对文件\n"
     ),
 }
@@ -560,6 +571,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-candidates", type=int, help=t("h.dup.max_candidates"))
     p.add_argument("--evidence", type=int, default=3, help=t("h.dup.evidence"))
     p.add_argument("-j", "--jobs", type=int, default=1, help=t("h.dup.jobs"))
+    p.add_argument("--progress", action="store_true", help=t("h.dup.progress"))
     p.add_argument("--top", type=int, default=50, help=t("h.dup.top"))
     p.add_argument("--all", action="store_true", help=t("h.dup.all"))
     p.add_argument("--fail-on", choices=("none", "any", "cross-user"),
@@ -602,6 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cross-language", action="store_true", help=t("h.dup.cross_language"))
     p.add_argument("--evidence", type=int, default=3, help=t("h.dup.evidence"))
     p.add_argument("-j", "--jobs", type=int, default=1, help=t("h.dup.jobs"))
+    p.add_argument("--progress", action="store_true", help=t("h.dup.progress"))
     p.add_argument("--fail-on", choices=("none", "duplicate", "any"), default="duplicate",
                    help=t("h.audit.fail_on"))
     p.set_defaults(func=cmd_audit)
